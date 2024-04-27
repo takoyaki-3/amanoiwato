@@ -39,8 +39,13 @@ func hashFile(path string) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-// downloadFile downloads a file from the specified S3 bucket using the correct input type.
 func downloadFile(sess *session.Session, bucket, key, destPath string) error {
+	
+	directory := filepath.Dir(destPath)
+	if _, err := os.Stat(directory); os.IsNotExist(err) {
+		os.MkdirAll(directory, os.ModePerm)
+	}
+
 	downloader := s3manager.NewDownloader(sess)
 	file, err := os.Create(destPath)
 	if err != nil {
@@ -48,7 +53,6 @@ func downloadFile(sess *session.Session, bucket, key, destPath string) error {
 	}
 	defer file.Close()
 
-	// Correcting DownloadInput to GetObjectInput from the s3 package.
 	_, err = downloader.Download(file, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -90,7 +94,6 @@ func uploadFile(sess *session.Session, bucket, filePath, key string) {
 	}
 	defer file.Close()
 
-	// Convert Windows file path separators to Unix/Linux style separators for S3 keys.
 	linuxKey := strings.ReplaceAll(key, "\\", "/")
 
 	_, err = uploader.Upload(&s3manager.UploadInput{
@@ -125,17 +128,38 @@ func main() {
 		log.Fatal("Error creating AWS session", err)
 	}
 
-	// Download existing CSV from S3 to check for previously uploaded files.
 	err = downloadFile(sess, bucket, remoteCSVPath, localCSVPath)
 	if err != nil {
 		log.Println("No existing CSV file on S3, or unable to download:", err)
-		// If there's no CSV, treat all files as new for uploading.
 	}
 
 	existingFiles, err := readCSV(localCSVPath)
 	if err != nil {
 		log.Println("Failed to read existing CSV:", err)
-		existingFiles = make(map[string][2]string) // Create an empty map if unable to read.
+		existingFiles = make(map[string][2]string)
+	}
+
+	// Create S3 client
+	s3Client := s3.New(sess)
+	// List all files in the S3 bucket
+	err = s3Client.ListObjectsV2Pages(&s3.ListObjectsV2Input{
+		Bucket: aws.String(bucket),
+	}, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
+		for _, object := range page.Contents {
+			key := *object.Key
+			// localPath := filepath.Join(storageDir, key)
+			localPath := strings.ReplaceAll(key, "/", "\\")
+			if _, err := os.Stat(localPath); os.IsNotExist(err) {
+				fmt.Printf("File %s does not exist locally. Downloading...\n", key)
+				if err := downloadFile(sess, bucket, key, localPath); err != nil {
+					log.Printf("Failed to download %s: %v\n", key, err)
+				}
+			}
+		}
+		return !lastPage
+	})
+	if err != nil {
+		log.Printf("Failed to list objects in bucket %s: %v\n", bucket, err)
 	}
 
 	func(){
@@ -156,7 +180,6 @@ func main() {
 			if !info.IsDir() {
 				modTime := info.ModTime().Format(time.RFC3339)
 				previousData, exists := existingFiles[path]
-				// Check if the file has been modified or is new
 				if !exists || previousData[1] != modTime {
 					hash := hashFile(path)
 					writer.Write([]string{path, hash, modTime})
@@ -164,7 +187,7 @@ func main() {
 					uploadFile(sess, bucket, path, relativePath)
 				} else {
 					writer.Write([]string{path, previousData[0], modTime})
-					fmt.Printf("Skipping upload, no changes for %s\n", path)
+					// fmt.Printf("Skipping upload, no changes for %s\n", path)
 				}
 			}
 			return nil
@@ -178,6 +201,5 @@ func main() {
 		}	
 	}()
 
-	// Upload the updated CSV file to S3
 	uploadFile(sess, bucket, localCSVPath, remoteCSVPath)
 }
