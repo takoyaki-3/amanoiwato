@@ -141,14 +141,15 @@ func main() {
 
 	// Create S3 client
 	s3Client := s3.New(sess)
+
 	// List all files in the S3 bucket
 	err = s3Client.ListObjectsV2Pages(&s3.ListObjectsV2Input{
 		Bucket: aws.String(bucket),
 	}, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
 		for _, object := range page.Contents {
 			key := *object.Key
-			// localPath := filepath.Join(storageDir, key)
-			localPath := strings.ReplaceAll(key, "/", "\\")
+			// Convert the key to the local file path format
+			localPath := filepath.FromSlash(key)  // Converts S3 key to OS-specific path format
 			if _, err := os.Stat(localPath); os.IsNotExist(err) {
 				fmt.Printf("File %s does not exist locally. Downloading...\n", key)
 				if err := downloadFile(sess, bucket, key, localPath); err != nil {
