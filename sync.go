@@ -19,12 +19,14 @@ import (
 	"github.com/joho/godotenv"
 )
 
+// Load environment variables
 func loadEnv() {
 	if err := godotenv.Load(); err != nil {
 		log.Fatal("Error loading .env file")
 	}
 }
 
+// Hash a file and return the hash as a string
 func hashFile(path string) string {
 	file, err := os.Open(path)
 	if err != nil {
@@ -39,8 +41,8 @@ func hashFile(path string) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
+// Download a file from an S3 bucket
 func downloadFile(sess *session.Session, bucket, key, destPath string) error {
-	
 	directory := filepath.Dir(destPath)
 	if _, err := os.Stat(directory); os.IsNotExist(err) {
 		os.MkdirAll(directory, os.ModePerm)
@@ -64,6 +66,7 @@ func downloadFile(sess *session.Session, bucket, key, destPath string) error {
 	return nil
 }
 
+// Read the CSV file and return a map of file paths to their hash and last modified time
 func readCSV(filePath string) (map[string][2]string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -86,6 +89,7 @@ func readCSV(filePath string) (map[string][2]string, error) {
 	return fileMap, nil
 }
 
+// Upload a file to an S3 bucket
 func uploadFile(sess *session.Session, bucket, filePath, key string) {
 	uploader := s3manager.NewUploader(sess)
 	file, err := os.Open(filePath)
@@ -107,14 +111,16 @@ func uploadFile(sess *session.Session, bucket, filePath, key string) {
 	fmt.Printf("Successfully uploaded %s to %s with key %s\n", filePath, bucket, linuxKey)
 }
 
+// Main execution function
 func main() {
 	loadEnv()
 
 	bucket := os.Getenv("S3_BUCKET")
-	storageDir := "storage"
-	localCSVPath := "file_list.csv"
+	localCSVPath := "remote_file_list.csv"
 	remoteCSVPath := "file_list.csv"
+	storageDir := "storage"
 
+	// Initialize AWS session
 	sess, err := session.NewSession(&aws.Config{
 		Region:           aws.String(os.Getenv("AWS_REGION")),
 		Endpoint:         aws.String(os.Getenv("S3_ENDPOINT")),
@@ -128,79 +134,42 @@ func main() {
 		log.Fatal("Error creating AWS session", err)
 	}
 
+	// Download the CSV file from the S3 bucket
 	err = downloadFile(sess, bucket, remoteCSVPath, localCSVPath)
 	if err != nil {
 		log.Println("No existing CSV file on S3, or unable to download:", err)
 	}
 
+	// Read the existing CSV file to get current file data
 	existingFiles, err := readCSV(localCSVPath)
 	if err != nil {
 		log.Println("Failed to read existing CSV:", err)
 		existingFiles = make(map[string][2]string)
 	}
 
-	// Create S3 client
-	s3Client := s3.New(sess)
-
-	// List all files in the S3 bucket
-	err = s3Client.ListObjectsV2Pages(&s3.ListObjectsV2Input{
-		Bucket: aws.String(bucket),
-	}, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
-		for _, object := range page.Contents {
-			key := *object.Key
-			// Convert the key to the local file path format
-			localPath := filepath.FromSlash(key)  // Converts S3 key to OS-specific path format
-			if _, err := os.Stat(localPath); os.IsNotExist(err) {
-				fmt.Printf("File %s does not exist locally. Downloading...\n", key)
-				if err := downloadFile(sess, bucket, key, localPath); err != nil {
-					log.Printf("Failed to download %s: %v\n", key, err)
-				}
+	// Walk through the local storage directory
+	err = filepath.Walk(storageDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			hash := hashFile(path)
+			modTime := info.ModTime().Format(time.RFC3339)
+			previousData, exists := existingFiles[path]
+			if !exists || previousData[0] != hash || previousData[1] != modTime {
+				fmt.Printf("Uploading updated or new file: %s\n", path)
+				relativePath := strings.TrimPrefix(path, storageDir+"/")
+				uploadFile(sess, bucket, path, relativePath)
 			}
 		}
-		return !lastPage
+		return nil
 	})
 	if err != nil {
-		log.Printf("Failed to list objects in bucket %s: %v\n", bucket, err)
+		log.Fatal("Error walking through storage directory", err)
 	}
 
-	func(){
-		csvFile, err := os.Create(localCSVPath)
-		if err != nil {
-			log.Fatal("Error creating CSV file", err)
-		}
-		defer csvFile.Close()
-	
-		writer := csv.NewWriter(csvFile)
-		defer writer.Flush()
-		writer.Write([]string{"Path", "Hash", "Last Modified"})
-	
-		err = filepath.Walk(storageDir, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-			if !info.IsDir() {
-				modTime := info.ModTime().Format(time.RFC3339)
-				previousData, exists := existingFiles[path]
-				if !exists || previousData[1] != modTime {
-					hash := hashFile(path)
-					writer.Write([]string{path, hash, modTime})
-					relativePath := strings.TrimPrefix(path, storageDir+"/")
-					uploadFile(sess, bucket, path, relativePath)
-				} else {
-					writer.Write([]string{path, previousData[0], modTime})
-					// fmt.Printf("Skipping upload, no changes for %s\n", path)
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			log.Fatal("Error walking through storage directory", err)
-		}
-	
-		if err := writer.Error(); err != nil {
-			log.Fatal("Error writing CSV", err)
-		}	
-	}()
-
+	// Upload the updated CSV file back to the S3 bucket
 	uploadFile(sess, bucket, localCSVPath, remoteCSVPath)
+
+	os.Remove(localCSVPath)
 }
