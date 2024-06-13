@@ -1,0 +1,8 @@
+version: '3.8'
+
+services:
+  sync_service:
+    build: .
+    volumes:
+      - ./storage:/storage
+    command: python sync.py
